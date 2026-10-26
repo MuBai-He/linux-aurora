@@ -55,6 +55,40 @@ pub(crate) enum IdentitySource {
     HostPersisted,
 }
 
+/// The root-key input and loading point verified for each nonce-session board.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SensorRootKey {
+    None,
+    /// Preserve J700's signed container upload before SESSION_SHARE.
+    J700,
+    /// J715's device-specific FDR MSRk body, uploaded only after status 0x16.
+    J715,
+}
+
+impl SensorRootKey {
+    pub(crate) const fn firmware(self) -> Option<&'static CStr> {
+        match self {
+            Self::None => None,
+            Self::J700 => Some(c"apple/msrk-j700.bin"),
+            Self::J715 => Some(c"apple/msrk-j715.bin"),
+        }
+    }
+
+    /// Only the observed J715 FDR body size is qualified. The enclave checks
+    /// its authenticity; a matching length alone does not authenticate it.
+    pub(crate) const fn accepts_length(self, length: usize) -> bool {
+        match self {
+            Self::None => false,
+            Self::J700 => length != 0,
+            Self::J715 => length == 10_848,
+        }
+    }
+
+    pub(crate) fn recover_share(self, status: Option<u32>) -> bool {
+        self == Self::J715 && status == Some(0x16)
+    }
+}
+
 /// SPI mode as the device tree spells it. Mode 1 is CPOL=0/CPHA=1 (`spi-cpha`);
 /// mode 2 is CPOL=1/CPHA=0 (`spi-cpol`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,6 +221,7 @@ pub(crate) struct PlatformProfile {
     pub(crate) keybag_create: KeybagCreate,
     /// Require nonce authentication and signed sensor material before capture.
     pub(crate) nonce_session: bool,
+    pub(crate) sensor_root_key: SensorRootKey,
     /// Key-store protocol generation (see [`KeyStore`]).
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
@@ -229,6 +264,7 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    sensor_root_key: SensorRootKey::None,
     // macOS shares this enclave: keep Linux to its own xART records.
     xart_guard: 1,
 };
@@ -269,6 +305,7 @@ pub(crate) const T6000: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    sensor_root_key: SensorRootKey::None,
     // As T8103. On J316s, creating the identity keybag also rewrites a
     // session record that predates Linux. The guard refuses that, so the
     // keybag can only be created there with xart_guard=0.
@@ -304,6 +341,7 @@ pub(crate) const T6020: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    sensor_root_key: SensorRootKey::None,
     // A warm-attach enclave shared with macOS, as on T8112.
     xart_guard: 1,
 };
@@ -359,6 +397,7 @@ pub(crate) const T8140: PlatformProfile = PlatformProfile {
         arg: -1,
     },
     nonce_session: true,
+    sensor_root_key: SensorRootKey::J700,
     // Linux records from before the guard's list exist here, and Linux has
     // left the macOS records unchanged on this platform.
     xart_guard: 0,
@@ -405,6 +444,7 @@ pub(crate) const T8112: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    sensor_root_key: SensorRootKey::None,
     // Guarded from its first Linux boot (2026-10-16): no record refused.
     xart_guard: 1,
 };
@@ -442,8 +482,12 @@ pub(crate) const T8122: PlatformProfile = PlatformProfile {
 /// ADT's own (see [`DART_T8132`]). The Mesa sensor sits on spi2 at
 /// `0x3ad108000`; its identity and wiring are unchecked, so capture stays
 /// unqualified. Like the M3, its enclave is shared with macOS.
+/// The successful J715 session uses nonce authentication, FDR MSRk recovery
+/// after SESSION_SHARE status 0x16, and source-6 FSC2 calibration.
 pub(crate) const T8132: PlatformProfile = PlatformProfile {
     name: "T8132/J715",
+    nonce_session: true,
+    sensor_root_key: SensorRootKey::J715,
     sensor: SensorProfile {
         controller_base: 0x3_ad10_8000,
         capture_qualified: false,
@@ -664,10 +708,82 @@ mod tests {
         assert!(T8122.wide_dma_mask);
         assert!(T8122.shmem_capacity == T8112.shmem_capacity);
         assert!(T8122.sensor.controller_base == 0x2_a110_8000);
-        assert!(!T8132.nonce_session);
+        assert!(T8132.nonce_session);
         assert!(T8132.wide_dma_mask);
         assert!(T8132.xart_guard == T8122.xart_guard);
         assert!(!T8132.sensor.capture_qualified);
+    }
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[kernel::macros::kunit_tests(apple_sep_sensor_root_key)]
+mod root_key_tests {
+    use super::*;
+
+    #[test]
+    fn non_nonce_boards_never_load_or_recover_a_root_key() {
+        // Given the existing non-nonce profiles, including inherited ones.
+        for profile in [&T8103, &T6000, &T6020, &T6020_SEPOS13, &T8112, &T8122] {
+            // When selecting their root-key policy.
+            let policy = profile.sensor_root_key;
+            // Then no file, upload or recovery is selected.
+            assert!(!profile.nonce_session);
+            assert!(policy.firmware().is_none());
+            assert!(!policy.accepts_length(10_848));
+            assert!(!policy.recover_share(Some(0x16)));
+        }
+    }
+
+    #[test]
+    fn j700_preserves_its_nonempty_container_without_share_recovery() {
+        // Given J700's existing signed-container policy.
+        let policy = T8140.sensor_root_key;
+        // When selecting firmware and handling the observed refusal.
+        let name = policy.firmware();
+        // Then the existing name and nonempty input rule remain in force.
+        assert!(T8140.nonce_session);
+        assert!(policy == SensorRootKey::J700);
+        assert!(name == Some(c"apple/msrk-j700.bin"));
+        assert!(!policy.accepts_length(0));
+        assert!(policy.accepts_length(1));
+        assert!(policy.accepts_length(1726));
+        assert!(!policy.recover_share(Some(0x16)));
+    }
+
+    #[test]
+    fn j715_accepts_only_the_qualified_fdr_body_length() {
+        // Given J715's nonce-session profile.
+        let policy = T8132.sensor_root_key;
+        // When selecting firmware and checking input sizes.
+        let name = policy.firmware();
+        // Then the public board name selects only the qualified FDR size.
+        assert!(T8132.nonce_session);
+        assert!(policy == SensorRootKey::J715);
+        assert!(name == Some(c"apple/msrk-j715.bin"));
+        assert!(policy.accepts_length(10_848));
+        for length in [0, 1, 1726, 10_847, 10_849, usize::MAX] {
+            assert!(!policy.accepts_length(length));
+        }
+    }
+
+    #[test]
+    fn j715_recovers_only_an_explicit_share_status_16() {
+        // Given J715's recovery policy.
+        let policy = T8132.sensor_root_key;
+        // When classifying answered and missing statuses.
+        let recover = policy.recover_share(Some(0x16));
+        // Then only the observed refusal selects the single retry path.
+        assert!(recover);
+        for status in [
+            None,
+            Some(0),
+            Some(1),
+            Some(0x15),
+            Some(0x17),
+            Some(u32::MAX),
+        ] {
+            assert!(!policy.recover_share(status));
+        }
     }
 }
 
