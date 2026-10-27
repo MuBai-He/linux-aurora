@@ -63,6 +63,8 @@ pub(crate) enum SensorRootKey {
     J700,
     /// J715's device-specific FDR MSRk body, uploaded only after status 0x16.
     J715,
+    /// J713's device-specific FDR MSRk body, under J715's rules.
+    J713,
 }
 
 impl SensorRootKey {
@@ -71,21 +73,23 @@ impl SensorRootKey {
             Self::None => None,
             Self::J700 => Some(c"apple/msrk-j700.bin"),
             Self::J715 => Some(c"apple/msrk-j715.bin"),
+            Self::J713 => Some(c"apple/msrk-j713.bin"),
         }
     }
 
-    /// Only the observed J715 FDR body size is qualified. The enclave checks
-    /// its authenticity; a matching length alone does not authenticate it.
+    /// Only the FDR body size observed on J715 and J713 is qualified. The
+    /// enclave checks its authenticity; a matching length alone does not
+    /// authenticate it.
     pub(crate) const fn accepts_length(self, length: usize) -> bool {
         match self {
             Self::None => false,
             Self::J700 => length != 0,
-            Self::J715 => length == 10_848,
+            Self::J715 | Self::J713 => length == 10_848,
         }
     }
 
     pub(crate) fn recover_share(self, status: Option<u32>) -> bool {
-        self == Self::J715 && status == Some(0x16)
+        matches!(self, Self::J715 | Self::J713) && status == Some(0x16)
     }
 }
 
@@ -497,6 +501,23 @@ pub(crate) const T8132: PlatformProfile = PlatformProfile {
     ..T8122
 };
 
+/// MacBook Air 13-inch M4 (J713). Its ADT matches J715's for the SEP
+/// (`sepfw-booted`, the same `dart-sep` window) and for the sensor's spi2
+/// controller, so this is the J715 profile with J713's own FDR MSRk file.
+/// The sensor reads back ID 0x3356 in mode 2 (CPOL=1/CPHA=0), which is what
+/// the J713 device tree states. Enrolment, matching and a cold-boot restore
+/// passed with the default xART guard.
+pub(crate) const T8132_J713: PlatformProfile = PlatformProfile {
+    name: "T8132/J713",
+    sensor_root_key: SensorRootKey::J713,
+    sensor: SensorProfile {
+        mode: SpiMode::Mode2,
+        expected_id: 0x3356,
+        ..T8132.sensor
+    },
+    ..T8132
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -660,9 +681,12 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
         return Ok(&T8122);
     }
-    // Only the board whose ADT was read.
+    // Only the boards whose ADTs were read.
     if machine_has(b"apple,t8132") && machine_has(b"apple,j715") {
         return Ok(&T8132);
+    }
+    if machine_has(b"apple,t8132") && machine_has(b"apple,j713") {
+        return Ok(&T8132_J713);
     }
     Err(ENODEV)
 }
@@ -712,6 +736,24 @@ mod tests {
         assert!(T8132.wide_dma_mask);
         assert!(T8132.xart_guard == T8122.xart_guard);
         assert!(!T8132.sensor.capture_qualified);
+    }
+
+    #[test]
+    fn j713_differs_from_j715_only_in_its_root_key_and_sensor_description() {
+        assert!(T8132_J713.nonce_session == T8132.nonce_session);
+        assert!(T8132_J713.wide_dma_mask == T8132.wide_dma_mask);
+        assert!(T8132_J713.xart_guard == T8132.xart_guard);
+        assert!(T8132_J713.persistent_enrol == T8132.persistent_enrol);
+        assert!(T8132_J713.shmem_capacity == T8132.shmem_capacity);
+        assert!(core::ptr::eq(T8132_J713.dart_window, T8132.dart_window));
+        assert!(T8132_J713.sensor.controller_base == T8132.sensor.controller_base);
+        assert!(T8132_J713.sensor.chip_select == T8132.sensor.chip_select);
+        assert!(T8132_J713.sensor.max_hz == T8132.sensor.max_hz);
+        assert!(T8132_J713.sensor.cs_setup_ns == T8132.sensor.cs_setup_ns);
+        assert!(T8132_J713.sensor.cs_hold_ns == T8132.sensor.cs_hold_ns);
+        assert!(T8132_J713.sensor.capture_qualified == T8132.sensor.capture_qualified);
+        assert!(T8132_J713.sensor.mode == SpiMode::Mode2);
+        assert!(T8132_J713.sensor.expected_id == 0x3356);
     }
 }
 
@@ -773,6 +815,43 @@ mod root_key_tests {
         // When classifying answered and missing statuses.
         let recover = policy.recover_share(Some(0x16));
         // Then only the observed refusal selects the single retry path.
+        assert!(recover);
+        for status in [
+            None,
+            Some(0),
+            Some(1),
+            Some(0x15),
+            Some(0x17),
+            Some(u32::MAX),
+        ] {
+            assert!(!policy.recover_share(status));
+        }
+    }
+
+    #[test]
+    fn j713_names_its_own_fdr_body_with_j715s_length_rule() {
+        // Given J713's nonce-session profile.
+        let policy = T8132_J713.sensor_root_key;
+        // When selecting firmware and checking input sizes.
+        let name = policy.firmware();
+        // Then J713 reads its own file, never J715's, at the same size.
+        assert!(T8132_J713.nonce_session);
+        assert!(policy == SensorRootKey::J713);
+        assert!(name == Some(c"apple/msrk-j713.bin"));
+        assert!(name != T8132.sensor_root_key.firmware());
+        assert!(policy.accepts_length(10_848));
+        for length in [0, 1, 1726, 10_847, 10_849, usize::MAX] {
+            assert!(!policy.accepts_length(length));
+        }
+    }
+
+    #[test]
+    fn j713_recovers_only_an_explicit_share_status_16() {
+        // Given J713's recovery policy.
+        let policy = T8132_J713.sensor_root_key;
+        // When classifying answered and missing statuses.
+        let recover = policy.recover_share(Some(0x16));
+        // Then it takes J715's single retry path and no other.
         assert!(recover);
         for status in [
             None,
