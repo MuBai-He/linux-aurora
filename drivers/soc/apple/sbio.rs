@@ -2189,6 +2189,7 @@ impl SepData {
                 name,
                 firmware.data().len()
             );
+            self.sensor_step_failed(c"SENSOR_ROOT_KEY");
             return false;
         }
         if !self.sensor_session_request(0x86, c"SENSOR_ROOT_KEY", firmware.data()) {
