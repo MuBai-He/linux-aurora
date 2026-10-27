@@ -483,6 +483,31 @@
 			status = "disabled";
 		};
 
+		/*
+		 * Touch ID. iBoot leaves the pads muxed and the controller uses
+		 * its native chip select, so there is no pinctrl here. clkref
+		 * divides to the sensor's 8 MHz exactly, and is the parent the
+		 * J713 sensor was enrolled and matched with.
+		 */
+		spi2: spi@3ad108000 {
+			compatible = "apple,t8132-spi", "apple,t8103-spi";
+			reg = <0x3 0xad108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1056 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			mesa: fingerprint@0 {
+				compatible = "apple,mesa-fingerprint";
+				reg = <0>;
+				spi-max-frequency = <8000000>;
+				status = "disabled";
+			};
+		};
+
 		serial0: serial@3ad200000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x3 0xad200000 0x0 0x1000>;
